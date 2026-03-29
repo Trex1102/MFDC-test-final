@@ -6,6 +6,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from detectron2.utils.comm import is_main_process
 from .calibration_layer import PrototypicalCalibrationBlock
+from .novel_methods import build_novel_method_pcb
 
 
 class DatasetEvaluator:
@@ -89,6 +90,51 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
         logger.info("Start initializing PCB module, please wait a seconds...")
         pcb = PrototypicalCalibrationBlock(cfg)
 
+        # Wrap PCB with novel method if enabled
+        if cfg.NOVEL_METHODS.ENABLE and cfg.NOVEL_METHODS.METHOD:
+            method_name = cfg.NOVEL_METHODS.METHOD
+            logger.info(f"Applying novel method: {method_name}")
+            pcb = build_novel_method_pcb(pcb, cfg, method_name)
+
+    # UPR-TTA two-pass: uncertainty-guided pseudo-label collection (replaces standard transductive)
+    if pcb is not None and hasattr(pcb, 'run_pass1') and cfg.NOVEL_METHODS.ENABLE:
+        method_name = cfg.NOVEL_METHODS.METHOD.lower()
+        if method_name in ("upr_tta", "upr", "uncertainty_refinement"):
+            with inference_context(model):
+                pcb.run_pass1(model, data_loader)
+
+    # Two-pass transductive: collect pseudo-labels in pass 1, rebuild, then evaluate in pass 2.
+    elif pcb is not None and cfg.TEST.PCB_TRANSDUCTIVE and not cfg.TEST.PCB_TRANS_ONLINE:
+        logger.info(
+            "Transductive inference pass 1: collecting pseudo-labels over %d images...",
+            len(data_loader),
+        )
+        pseudo_dict = {}
+        with inference_context(model), torch.no_grad():
+            for inputs in data_loader:
+                cur_idx = sum(len(v.get("features", [])) for v in pseudo_dict.values())
+                outputs = model(inputs)
+                if cfg.TEST.PCB_TRANS_PSEUDO_CALIBRATED:
+                    outputs = pcb.execute_calibration(inputs, outputs, allow_reassign=False)
+                pcb.collect_pseudo(inputs, outputs, pseudo_dict)
+                new_idx = sum(len(v.get("features", [])) for v in pseudo_dict.values())
+                if new_idx > 0 and (new_idx // max(cfg.TEST.PCB_TRANS_MAX_PER_CLASS, 1)) != (cur_idx // max(cfg.TEST.PCB_TRANS_MAX_PER_CLASS, 1)):
+                    logger.info(
+                        "Transductive pass 1 progress: pseudo_classes=%d pseudo_samples=%d",
+                        len(pseudo_dict),
+                        new_idx,
+                    )
+            logger.info(
+                "Transductive pass 1 complete: pseudo_classes=%d pseudo_samples=%d",
+                len(pseudo_dict),
+                sum(len(v.get('features', [])) for v in pseudo_dict.values()),
+            )
+        pcb.rebuild_with_pseudo(pseudo_dict)
+        logger.info("Transductive inference pass 2: final evaluation...")
+
+    # Online transductive: accumulate pseudo across images, rebuild after each.
+    online_pseudo = {} if (pcb is not None and cfg.TEST.PCB_TRANSDUCTIVE and cfg.TEST.PCB_TRANS_ONLINE) else None
+
     logger.info("Start inference on {} images".format(len(data_loader)))
     total = len(data_loader)  # inference data loader must have a fixed length
     evaluator.reset()
@@ -107,7 +153,12 @@ def inference_on_dataset(model, data_loader, evaluator, cfg=None):
             outputs = model(inputs)
             if cfg.TEST.PCB_ENABLE:
                 outputs = pcb.execute_calibration(inputs, outputs)
-            torch.cuda.synchronize()
+                if online_pseudo is not None:
+                    pcb.collect_pseudo(inputs, outputs, online_pseudo)
+                    pcb.rebuild_with_pseudo(online_pseudo)
+            # CPU-only runs should skip CUDA synchronization.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             total_compute_time += time.time() - start_compute_time
             evaluator.process(inputs, outputs)
 

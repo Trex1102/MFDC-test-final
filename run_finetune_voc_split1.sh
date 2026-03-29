@@ -11,7 +11,7 @@ echo "=== Starting fine-tuning for VOC split ${SPLIT_ID} ==="
 
 for seed in 0
 do
-    for shot in 1
+    for shot in 2 3
     do
         echo ""
         echo ">>> Running ${shot}-shot seed ${seed} ..."
